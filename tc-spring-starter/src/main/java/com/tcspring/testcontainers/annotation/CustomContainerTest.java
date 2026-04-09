@@ -48,6 +48,18 @@ import java.lang.annotation.*;
  *     @Value("${app.trades.db.url}")  String tradesUrl;
  * }
  * }</pre>
+ *
+ * <h2>Container lifecycle and {@code @DirtiesContext}</h2>
+ * <p>By default, containers are shared across test classes for speed.
+ * Use {@code @DirtiesContext} when a test needs a fresh container (clean
+ * database, empty Redis, etc.):
+ * <pre>{@code
+ * @DirtiesContext
+ * @CustomContainerTest
+ * class DestructiveIT { ... }
+ * }</pre>
+ * <p>The starter stops and removes containers when the context closes,
+ * so the next test class gets brand-new containers.
  */
 @Target(ElementType.TYPE)
 @Retention(RetentionPolicy.RUNTIME)

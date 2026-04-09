@@ -4,6 +4,7 @@ import com.tcspring.testcontainers.core.ContainerProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.BeansException;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.config.BeanFactoryPostProcessor;
 import org.springframework.beans.factory.config.ConfigurableListableBeanFactory;
 import org.springframework.core.env.ConfigurableEnvironment;
@@ -17,8 +18,10 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -35,8 +38,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * bean definitions are loaded but before any bean instance is created.
  * Containers started here are therefore available before {@code @Value}
  * injection happens.
+ *
+ * <h2>Container sharing and {@code @DirtiesContext}</h2>
+ * <p>Containers are stored in static JVM-wide registries keyed by logical name.
+ * Test classes that share the same Spring context reuse the same containers.
+ *
+ * <p>When {@code @DirtiesContext} is used, the Spring context is closed and
+ * {@link #destroy()} stops all containers started by that context, removing
+ * them from the registries. The next context starts fresh containers with
+ * clean state (empty database, empty Redis, etc.).
+ *
+ * <p>Without {@code @DirtiesContext}, containers are shared across test classes
+ * for faster execution. Any data written by one test is visible to the next.
  */
-public class ContainerBeanRegistrar implements BeanFactoryPostProcessor {
+public class ContainerBeanRegistrar implements BeanFactoryPostProcessor, DisposableBean {
 
     private static final Logger log = LoggerFactory.getLogger(ContainerBeanRegistrar.class);
 
@@ -60,10 +75,40 @@ public class ContainerBeanRegistrar implements BeanFactoryPostProcessor {
     private final ConfigurableEnvironment environment;
     private final ContainerProperties     props;
 
+    // Tracks container names started by THIS context — used for cleanup on @DirtiesContext
+    private final Set<String> startedContainerNames = new HashSet<>();
+
     public ContainerBeanRegistrar(ConfigurableEnvironment environment,
                                    ContainerProperties props) {
         this.environment = environment;
         this.props       = props;
+    }
+
+    /**
+     * Called when the Spring context is closed (e.g. via {@code @DirtiesContext}).
+     * Stops all containers started by this context and removes them from the
+     * static registries so the next context gets fresh containers.
+     */
+    @Override
+    public void destroy() {
+        if (startedContainerNames.isEmpty()) return;
+        log.info("[TC-Spring] Context closing — stopping {} container(s)", startedContainerNames.size());
+        for (String name : startedContainerNames) {
+            stopAndRemove(name, KAFKA_REGISTRY);
+            stopAndRemove(name, ORACLE_REGISTRY);
+            stopAndRemove(name, IBMMQ_REGISTRY);
+            stopAndRemove(name, REDIS_REGISTRY);
+            stopAndRemove(name, SQLSERVER_REGISTRY);
+        }
+        startedContainerNames.clear();
+    }
+
+    private void stopAndRemove(String name, Map<String, ? extends GenericContainer<?>> registry) {
+        GenericContainer<?> c = registry.remove(name);
+        if (c != null && c.isRunning()) {
+            log.info("[TC-Spring] Stopping container '{}'", name);
+            c.stop();
+        }
     }
 
     @Override
@@ -87,6 +132,7 @@ public class ContainerBeanRegistrar implements BeanFactoryPostProcessor {
             Map<String, GenericContainer<?>> started = new HashMap<>();
             for (ContainerDefinition def : builder.getDefinitions()) {
                 started.put(def.getName(), startContainer(def));
+                startedContainerNames.add(def.getName());
             }
 
             // Resolve and collect all property bindings

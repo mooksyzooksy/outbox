@@ -101,6 +101,27 @@ class TradeServiceIT {
 }
 ```
 
+## Container Lifecycle and `@DirtiesContext`
+
+By default, containers are **shared across test classes** within the same JVM for speed. A Kafka container started by `SingleKafkaClusterIT` is reused by `FullStackIT` if they both declare a container named `"default"`.
+
+This means data written by one test class is visible to the next. When you need a **fresh container with clean state** (empty database, flushed Redis, etc.), use `@DirtiesContext`:
+
+```java
+@DirtiesContext
+@OracleContainerTest
+class DestructiveSchemaIT {
+    // Gets a fresh Oracle container — clean database
+    // Container is stopped when this class finishes
+}
+```
+
+| Scenario | Behavior |
+|---|---|
+| No `@DirtiesContext` | Containers shared across test classes (fast) |
+| `@DirtiesContext` | Containers stopped on context close, fresh ones for next class |
+| `@DirtiesContext(classMode = AFTER_EACH_TEST_METHOD)` | Fresh containers per test method (slow but fully isolated) |
+
 ## Configuration Reference
 
 Override in `src/test/resources/application-test.properties`:
