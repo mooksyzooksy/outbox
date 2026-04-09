@@ -1,0 +1,20 @@
+{
+  "groups": [
+    { "name": "tc.testcontainers.kafka",  "type": "com.tcspring.testcontainers.core.ContainerProperties$Kafka" },
+    { "name": "tc.testcontainers.oracle", "type": "com.tcspring.testcontainers.core.ContainerProperties$Oracle" },
+    { "name": "tc.testcontainers.ibm-mq", "type": "com.tcspring.testcontainers.core.ContainerProperties$IbmMq" }
+  ],
+  "properties": [
+    { "name": "tc.testcontainers.kafka.image",          "type": "java.lang.String", "defaultValue": "apache/kafka-native:3.8.0" },
+    { "name": "tc.testcontainers.oracle.image",         "type": "java.lang.String", "defaultValue": "gvenzl/oracle-xe:21-slim-faststart" },
+    { "name": "tc.testcontainers.oracle.username",      "type": "java.lang.String", "defaultValue": "testuser" },
+    { "name": "tc.testcontainers.oracle.password",      "type": "java.lang.String", "defaultValue": "testpass" },
+    { "name": "tc.testcontainers.oracle.database",      "type": "java.lang.String", "defaultValue": "XEPDB1" },
+    { "name": "tc.testcontainers.ibm-mq.image",         "type": "java.lang.String", "defaultValue": "icr.io/ibm-messaging/mq:latest" },
+    { "name": "tc.testcontainers.ibm-mq.queue-manager", "type": "java.lang.String", "defaultValue": "QM1" },
+    { "name": "tc.testcontainers.ibm-mq.app-password",  "type": "java.lang.String", "defaultValue": "passw0rd1" },
+    { "name": "tc.testcontainers.ibm-mq.admin-password","type": "java.lang.String", "defaultValue": "passw0rd1" },
+    { "name": "tc.testcontainers.ibm-mq.channel",       "type": "java.lang.String", "defaultValue": "DEV.APP.SVRCONN" },
+    { "name": "tc.testcontainers.ibm-mq.queue",         "type": "java.lang.String", "defaultValue": "DEV.QUEUE.1" }
+  ]
+}

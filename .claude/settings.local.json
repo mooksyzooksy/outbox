@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(java:*)",
+      "Bash(mvn --version)",
+      "Bash(docker info:*)",
+      "Bash(mvn clean:*)",
+      "Bash(mvn test:*)",
+      "Bash(docker context:*)",
+      "Bash(docker version:*)",
+      "Bash('C:/Program Files/Docker/Docker/Docker Desktop.exe')",
+      "Bash(xargs -r docker stop)",
+      "Bash(docker container:*)",
+      "Bash(jar tf:*)",
+      "Bash(mvn dependency:tree -pl tc-spring-starter)",
+      "Bash(mvn verify:*)"
+    ]
+  }
+}
