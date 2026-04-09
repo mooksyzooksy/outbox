@@ -1,0 +1,192 @@
+package com.tcspring.testcontainers.core;
+
+import com.tcspring.testcontainers.core.registry.ContainerRegistry;
+import com.tcspring.testcontainers.core.registry.ContainerRequest;
+import com.tcspring.testcontainers.core.registry.ResolvedContainers;
+import com.tcspring.testcontainers.core.spi.ContainerConsumer;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationContextInitializer;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.event.ContextRefreshedEvent;
+import org.springframework.core.env.MapPropertySource;
+import org.springframework.test.context.support.TestPropertySourceUtils;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.OracleContainer;
+import org.testcontainers.kafka.KafkaContainer;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Unified {@link ApplicationContextInitializer} for the tc-spring-starter.
+ *
+ * <p>Handles container startup and property injection in two phases:
+ *
+ * <h2>Phase 1 — before context refresh</h2>
+ * <p>Reads {@code enabled} flags. For each enabled flag starts the corresponding
+ * {@code "default"} named container and injects standard Spring property keys
+ * via a {@link MapPropertySource} added at the <strong>front</strong> of the
+ * property source chain. This guarantees the properties are resolved before
+ * any {@code @Value} field or auto-configuration condition is evaluated,
+ * regardless of how this initializer was invoked (directly via
+ * {@code @ContextConfiguration} or through the {@code ContextCustomizerFactory}).
+ *
+ * <h2>Phase 2 — after ContextRefreshedEvent</h2>
+ * <p>Discovers all {@link ContainerConsumer} beans. For each consumer, starts
+ * any named containers declared in {@link ContainerConsumer#requests()} and
+ * calls {@link ContainerConsumer#bindProperties} so the consumer can register
+ * its own custom property keys with full freedom.
+ */
+public class ContainerInitializer
+        implements ApplicationContextInitializer<ConfigurableApplicationContext> {
+
+    private static final Logger log = LoggerFactory.getLogger(ContainerInitializer.class);
+
+    /** Property source name — placed first so it wins over all other sources. */
+    private static final String PROPERTY_SOURCE_NAME = "tcspring-container-properties";
+
+    @Override
+    public void initialize(ConfigurableApplicationContext ctx) {
+        ContainerProperties props = resolveProperties(ctx);
+
+        // ── PHASE 1: enabled-flag containers ──────────────────────────────
+        List<ContainerRequest<?>> phase1 = buildPhase1Requests(props);
+        if (!phase1.isEmpty()) {
+            ResolvedContainers resolved = ContainerRegistry.resolve(phase1, props);
+            injectPhase1Properties(ctx, resolved, props);
+        }
+
+        // ── PHASE 2: ContainerConsumer beans (post-refresh) ───────────────
+        ctx.addApplicationListener(event -> {
+            if (!(event instanceof ContextRefreshedEvent)) return;
+
+            Map<String, ContainerConsumer> consumers =
+                    ctx.getBeansOfType(ContainerConsumer.class);
+            if (consumers.isEmpty()) return;
+
+            log.info("[TC-Spring] Discovered {} ContainerConsumer(s)", consumers.size());
+
+            consumers.forEach((beanName, consumer) -> {
+                log.debug("[TC-Spring] Processing ContainerConsumer '{}'", beanName);
+                ResolvedContainers resolved =
+                        ContainerRegistry.resolve(consumer.requests(), props);
+                // Phase 2 uses TestPropertySourceUtils — these are application-level
+                // custom properties (custom namespaces, extra topics, etc.) where
+                // timing relative to auto-configuration is not critical.
+                consumer.bindProperties(resolved,
+                        (name, valueSupplier) ->
+                                TestPropertySourceUtils.addInlinedPropertiesToEnvironment(
+                                        ctx, name + "=" + valueSupplier.get()));
+            });
+        });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 1 helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private List<ContainerRequest<?>> buildPhase1Requests(ContainerProperties props) {
+        List<ContainerRequest<?>> requests = new ArrayList<>();
+        if (props.getKafka().isEnabled())  requests.add(ContainerRequest.kafka("default"));
+        if (props.getOracle().isEnabled()) requests.add(ContainerRequest.oracle("default"));
+        if (props.getIbmMq().isEnabled())  requests.add(ContainerRequest.ibmMq("default"));
+        return requests;
+    }
+
+    /**
+     * Injects all Phase 1 container coordinates into the Environment as a single
+     * {@link MapPropertySource} placed at the front of the property source chain.
+     *
+     * <p>Using {@code addFirst()} rather than {@code TestPropertySourceUtils}
+     * guarantees the highest possible priority — the values are visible to
+     * {@code @Value} resolution, {@code @ConditionalOnProperty}, and Spring Boot
+     * auto-configuration regardless of when this initializer fires in the
+     * test context lifecycle.
+     */
+    private void injectPhase1Properties(ConfigurableApplicationContext ctx,
+                                         ResolvedContainers resolved,
+                                         ContainerProperties props) {
+        Map<String, Object> map = new LinkedHashMap<>();
+
+        if (props.getKafka().isEnabled()) {
+            KafkaContainer kafka = resolved.kafka("default");
+            map.put("spring.kafka.bootstrap-servers", kafka.getBootstrapServers());
+            log.info("[TC-Spring] [kafka/default] bootstrap-servers={}",
+                    kafka.getBootstrapServers());
+        }
+
+        if (props.getOracle().isEnabled()) {
+            OracleContainer oracle = resolved.oracle("default");
+            map.put("spring.datasource.url",               oracle.getJdbcUrl());
+            map.put("spring.datasource.username",          oracle.getUsername());
+            map.put("spring.datasource.password",          oracle.getPassword());
+            map.put("spring.datasource.driver-class-name", oracle.getDriverClassName());
+            log.info("[TC-Spring] [oracle/default] url={}", oracle.getJdbcUrl());
+        }
+
+        if (props.getIbmMq().isEnabled()) {
+            GenericContainer<?> mq = resolved.ibmMq("default");
+            String connName = mq.getHost()
+                    + "(" + mq.getMappedPort(ContainerRegistry.MQ_PORT) + ")";
+            map.put("ibm.mq.queueManager", props.getIbmMq().getQueueManager());
+            map.put("ibm.mq.channel",      props.getIbmMq().getChannel());
+            map.put("ibm.mq.connName",     connName);
+            map.put("ibm.mq.user",         "app");
+            map.put("ibm.mq.password",     props.getIbmMq().getAppPassword());
+            log.info("[TC-Spring] [ibmmq/default] connName={}", connName);
+        }
+
+        if (!map.isEmpty()) {
+            ctx.getEnvironment().getPropertySources()
+               .addFirst(new MapPropertySource(PROPERTY_SOURCE_NAME, map));
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Property resolution — read from Environment before containers start
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private ContainerProperties resolveProperties(ConfigurableApplicationContext ctx) {
+        var env = ctx.getEnvironment();
+        ContainerProperties p = new ContainerProperties();
+
+        // Kafka
+        p.getKafka().setEnabled(env.getProperty(
+                "tc.testcontainers.kafka.enabled", Boolean.class, false));
+        p.getKafka().setImage(env.getProperty(
+                "tc.testcontainers.kafka.image", p.getKafka().getImage()));
+
+        // Oracle
+        p.getOracle().setEnabled(env.getProperty(
+                "tc.testcontainers.oracle.enabled", Boolean.class, false));
+        p.getOracle().setImage(   env.getProperty("tc.testcontainers.oracle.image",
+                p.getOracle().getImage()));
+        p.getOracle().setUsername(env.getProperty("tc.testcontainers.oracle.username",
+                p.getOracle().getUsername()));
+        p.getOracle().setPassword(env.getProperty("tc.testcontainers.oracle.password",
+                p.getOracle().getPassword()));
+        p.getOracle().setDatabase(env.getProperty("tc.testcontainers.oracle.database",
+                p.getOracle().getDatabase()));
+
+        // IBM MQ
+        p.getIbmMq().setEnabled(env.getProperty(
+                "tc.testcontainers.ibm-mq.enabled", Boolean.class, false));
+        p.getIbmMq().setImage(        env.getProperty("tc.testcontainers.ibm-mq.image",
+                p.getIbmMq().getImage()));
+        p.getIbmMq().setQueueManager( env.getProperty("tc.testcontainers.ibm-mq.queue-manager",
+                p.getIbmMq().getQueueManager()));
+        p.getIbmMq().setAppPassword(  env.getProperty("tc.testcontainers.ibm-mq.app-password",
+                p.getIbmMq().getAppPassword()));
+        p.getIbmMq().setAdminPassword(env.getProperty("tc.testcontainers.ibm-mq.admin-password",
+                p.getIbmMq().getAdminPassword()));
+        p.getIbmMq().setChannel(      env.getProperty("tc.testcontainers.ibm-mq.channel",
+                p.getIbmMq().getChannel()));
+        p.getIbmMq().setQueue(        env.getProperty("tc.testcontainers.ibm-mq.queue",
+                p.getIbmMq().getQueue()));
+
+        return p;
+    }
+}
