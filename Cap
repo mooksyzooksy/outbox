@@ -1,0 +1,958 @@
+# CDC Library & Spring Boot Starter — Technical Specification
+
+> **Target agent:** Read this document fully before writing any code.  
+> **First mandatory step:** Analyse the existing CDC library codebase in its entirety. Identify what is reusable, what must be replaced, and what must be wrapped. Map existing classes to the interfaces defined in this spec before creating anything new. Prefer adaptation over rewrite wherever the logic is sound.
+
+---
+
+## 1. Context & Goals
+
+### 1.1 Background
+
+A colleague has built a POC CDC (Change Data Capture) library that mines an Oracle database using LogMiner. It is a plain Java library with no Spring dependency. It currently:
+
+- Reads a JSON config file (connection details, table list, SQL query, column mappings)
+- Creates its own Hikari connection pool from that config
+- Executes the provided SQL query against LogMiner, injecting runtime variables (SCN bounds etc.) into it
+- Returns change events as results
+- Saves an SCN checkpoint internally
+
+### 1.2 Problems with Current Design
+
+| Problem | Impact |
+|---|---|
+| Owns its own Hikari pool | Duplicate connection pool in host microservice |
+| Saves SCN checkpoint independently | Not transactionally safe — checkpoint and inbox write are separate |
+| JSON file path config | Cannot be driven by Spring `@ConfigurationProperties` |
+| Column mapping baked into JSON config | Not overridable at runtime |
+| No defined error handling contract | Silent failures in production |
+| No lifecycle hooks | No observability |
+
+### 1.3 Goals
+
+1. **Preserve pure Java usability** — the library must remain usable in a plain Java application with no Spring dependency, exactly as it is today (main method, manual wiring)
+2. **Refactor core internals** — replace problematic patterns (own Hikari pool, internal checkpoint) with clean interfaces, while reusing existing LogMiner query logic wherever possible
+3. **Create a Spring Boot starter** — provides auto-configuration, `@ConfigurationProperties`, scheduling, health indicator, and Micrometer metrics on top of the core library
+4. **Interface-driven design** — every concern that varies across host services is expressed as an interface with a sensible default, overridable via `@ConditionalOnMissingBean` in Spring or constructor injection in pure Java
+
+---
+
+## 2. Module Structure
+
+```
+cdc-core/                        ← pure Java, no Spring dependency
+cdc-spring-starter/              ← Spring Boot auto-configuration on top of cdc-core
+```
+
+### 2.1 `cdc-core` — Package Layout
+
+```
+com.platform.cdc.core
+  ├── client/
+  │     CdcClient.java                     (interface)
+  │     DefaultCdcClient.java              (implementation)
+  │     CdcConnectionProvider.java         (interface)
+  │     HikariCdcConnectionProvider.java   (pure Java default)
+  │     CurrentScnProvider.java            (interface)
+  │     DefaultCurrentScnProvider.java     (default — queries v$database)
+  ├── config/
+  │     CdcConfiguration.java              (root config model)
+  │     ConnectionConfig.java
+  │     PollingConfig.java
+  │     CheckpointConfig.java
+  │     PersistenceConfig.java
+  │     NamedParameterQuery.java           (utility — :param → ? resolution)
+  ├── engine/
+  │     CdcEngine.java                     (orchestrator — see Section 6)
+  │     CdcFatalException.java
+  ├── event/
+  │     CdcEvent.java
+  │     OperationType.java
+  │     PollRequest.java
+  ├── filter/
+  │     CdcEventFilter.java                (interface)
+  │     OperationTypeFilter.java
+  │     TableFilter.java
+  │     SchemaFilter.java
+  │     CompositeCdcEventFilter.java
+  ├── handler/
+  │     CdcEventHandler.java               (interface)
+  │     LoggingCdcEventHandler.java        (default — logs only)
+  ├── checkpoint/
+  │     CheckpointStrategy.java            (interface)
+  │     InMemoryCheckpointStrategy.java    (default — pure Java / testing)
+  ├── mapper/
+  │     CdcResultMapper.java               (interface)
+  │     DefaultCdcResultMapper.java        (maps ResultSet columns → Map<String,Object>)
+  │     CdcRowMapper.java                  (interface — host maps SQL_REDO/UNDO → business data)
+  ├── error/
+  │     CdcErrorHandler.java               (interface)
+  │     DefaultCdcErrorHandler.java
+  │     CdcPollingException.java
+  │     CdcFatalException.java
+  ├── lifecycle/
+  │     CdcLifecycleListener.java          (interface)
+  └── query/
+        CdcQueryProvider.java              (interface — MANDATORY, no default)
+```
+
+### 2.2 `cdc-spring-starter` — Package Layout
+
+```
+com.platform.cdc.starter
+  ├── autoconfigure/
+  │     CdcAutoConfiguration.java
+  │     CdcSchedulingConfiguration.java
+  ├── annotation/
+  │     EnableCdc.java
+  ├── properties/
+  │     CdcProperties.java
+  ├── connection/
+  │     DataSourceCdcConnectionProvider.java
+  ├── checkpoint/
+  │     JdbcCheckpointStrategy.java
+  ├── handler/
+  │     JdbcCdcEventHandler.java
+  └── config/
+        SpringCdcConfigurationLoader.java
+
+src/main/resources/
+  META-INF/
+    spring/
+      org.springframework.boot.autoconfigure.AutoConfiguration.imports
+  cdc-config-template.json          ← sample JSON for pure Java users
+```
+
+---
+
+## 3. Agent Instructions — Analyse First
+
+> **Before writing any new code**, perform the following analysis of the existing library:
+
+1. **Identify the LogMiner query execution logic** — this is the highest-value reusable piece. Find the class(es) responsible for preparing and executing the SQL query against LogMiner. This logic should be extracted and placed inside `DefaultCdcClient`, adapting its connection handling to use `CdcConnectionProvider` instead of an internal datasource.
+
+2. **Identify the JSON config parsing logic** — map each JSON field to the corresponding field in `CdcConfiguration` / its nested config classes. The `JsonFileCdcConfigurationLoader` should delegate to existing parsing logic rather than reimplementing it.
+
+3. **Identify the checkpoint management code** — this will be replaced by `CheckpointStrategy`. The existing implementation may be adapted into `InMemoryCheckpointStrategy` if it holds state in memory, or discarded if it writes to DB (that responsibility moves to `JdbcCheckpointStrategy` in the starter).
+
+4. **Identify the result mapping logic** — map it to `DefaultCdcResultMapper` and `DefaultCdcRowMapper`. If the existing library parses `SQL_REDO`/`SQL_UNDO` columns, extract that into a utility used by the default `CdcRowMapper`.
+
+5. **Identify runtime variable injection** — how SCN bounds and other runtime values are injected into the query. This maps to `NamedParameterQuery` resolution inside `DefaultCdcClient.prepareStatement()`.
+
+6. **Identify the poll loop** — map it to `CdcEngine.tick()` and `CdcEngine.start()`. Extract timing/sleep logic into `PollingConfig`.
+
+7. **Identify connection/Hikari setup** — this moves entirely to `HikariCdcConnectionProvider`. Remove it from the library's core flow.
+
+---
+
+## 4. Core Interfaces
+
+### 4.1 Mandatory Contracts (no default — fail fast if missing)
+
+#### `CdcQueryProvider`
+```java
+public interface CdcQueryProvider {
+    String getQuery();
+}
+```
+The host service provides the LogMiner SQL query. No default implementation. If absent, the starter must throw `CdcConfigurationException` at startup with a clear message indicating the bean is required.
+
+#### `CdcRowMapper`
+```java
+public interface CdcRowMapper {
+    Map<String, Object> mapRow(String sqlRedo, String sqlUndo, OperationType operation);
+}
+```
+Maps the `SQL_REDO` / `SQL_UNDO` columns from LogMiner into a business data map. The host service knows the table schema and is responsible for this mapping. No default implementation. Fail fast if missing.
+
+### 4.2 Optional Contracts (default provided)
+
+#### `CdcConnectionProvider`
+```java
+public interface CdcConnectionProvider {
+    Connection getConnection() throws SQLException;
+    void releaseConnection(Connection connection);
+}
+```
+- Pure Java default: `HikariCdcConnectionProvider` — creates its own Hikari pool from `ConnectionConfig`
+- Spring default: `DataSourceCdcConnectionProvider` — borrows from Spring's primary `DataSource`, uses `DataSourceUtils.releaseConnection()` for transaction participation
+
+#### `CurrentScnProvider`
+```java
+public interface CurrentScnProvider {
+    long getCurrentScn(Connection connection) throws SQLException;
+}
+```
+Default: `DefaultCurrentScnProvider` — executes `SELECT current_scn FROM v$database`. Host overrides if Oracle setup uses a different view.
+
+#### `CdcResultMapper`
+```java
+public interface CdcResultMapper {
+    List<CdcEvent> map(ResultSet rs) throws SQLException;
+}
+```
+Default: `DefaultCdcResultMapper` — iterates `ResultSet`, reads standard LogMiner metadata columns (SCN, SEG_OWNER, SEG_NAME, OPERATION, TIMESTAMP), delegates business data columns to `CdcRowMapper`.
+
+#### `CheckpointStrategy`
+```java
+public interface CheckpointStrategy {
+    long loadLastScn();
+    void saveScn(long scn);
+}
+```
+- Pure Java default: `InMemoryCheckpointStrategy` — holds SCN in memory, resets on restart
+- Spring default: `JdbcCheckpointStrategy` — persists to a configurable DB table, participates in the host's transaction
+
+#### `CdcEventHandler`
+```java
+public interface CdcEventHandler {
+    void handle(List<CdcEvent> events);
+}
+```
+- Pure Java default: `LoggingCdcEventHandler` — logs events only
+- Spring default: `JdbcCdcEventHandler` — persists events to a configurable inbox table
+
+#### `CdcEventFilter`
+```java
+public interface CdcEventFilter {
+    boolean accept(CdcEvent event);
+}
+```
+Multiple beans collected automatically. Engine applies all filters in order — event is dropped if any filter returns `false`. Default: passthrough (no filter registered = all events pass).
+
+Provided implementations in `cdc-core`:
+- `OperationTypeFilter(Set<OperationType> allowed)`
+- `TableFilter(Set<String> allowedTables)`
+- `SchemaFilter(Set<String> allowedSchemas)`
+- `CompositeCdcEventFilter(List<CdcEventFilter> filters)` — AND semantics
+
+#### `CdcErrorHandler`
+```java
+public interface CdcErrorHandler {
+    void onPollError(Exception e, PollRequest request);
+    void onEventHandlingError(Exception e, List<CdcEvent> events);
+    void onCheckpointError(Exception e, long scn);
+}
+```
+Default (`DefaultCdcErrorHandler`):
+- `onPollError` → log + skip tick, do not advance checkpoint
+- `onEventHandlingError` → log + throw `CdcFatalException` → engine stops
+- `onCheckpointError` → log + throw `CdcFatalException` → engine stops
+
+#### `CdcLifecycleListener`
+```java
+public interface CdcLifecycleListener {
+    default void onStart() {}
+    default void onStop() {}
+    default void onPollComplete(List<CdcEvent> events, PollRequest request) {}
+    default void onCatchupLoop(int iteration, long fromScn, long toScn) {}
+}
+```
+Default: no-op. Host registers a bean to hook into engine lifecycle for observability, metrics, or custom logic.
+
+---
+
+## 5. Core Models
+
+### `CdcEvent`
+```java
+public class CdcEvent {
+    private final long scn;
+    private final String schema;
+    private final String tableName;
+    private final OperationType operation;
+    private final Instant timestamp;
+    private final Map<String, Object> data;   // populated by CdcRowMapper
+}
+```
+
+### `OperationType`
+```java
+public enum OperationType {
+    INSERT, UPDATE, DELETE
+}
+```
+
+### `PollRequest`
+```java
+public class PollRequest {
+    private final long fromScn;
+    private final long toScn;
+    private final int maxResults;
+}
+```
+
+### `CdcConfiguration`
+```java
+public class CdcConfiguration {
+    private final ConnectionConfig connection;
+    private final List<TableFilter> tables;
+    private final PollingConfig polling;
+    private final CheckpointConfig checkpoint;
+    private final PersistenceConfig persistence;
+}
+```
+
+### `PollingConfig`
+```java
+public class PollingConfig {
+    private final Duration interval;     // default: 5s
+    private final int batchSize;         // default: 500
+}
+```
+
+### `CheckpointConfig`
+```java
+public class CheckpointConfig {
+    private final String tableName;      // default: cdc_checkpoint
+}
+```
+
+### `PersistenceConfig`
+```java
+public class PersistenceConfig {
+    private final String tableName;      // default: cdc_inbox
+}
+```
+
+---
+
+## 6. `CdcEngine` — Full Specification
+
+`CdcEngine` is the central orchestrator. It is stateless regarding business logic — it delegates everything to injected interfaces. It owns only the poll loop and tick orchestration.
+
+### 6.1 Constructor Dependencies
+
+```java
+public class CdcEngine {
+    private final CdcClient client;
+    private final CurrentScnProvider currentScnProvider;
+    private final CheckpointStrategy checkpointStrategy;
+    private final CdcEventHandler eventHandler;
+    private final CdcErrorHandler errorHandler;
+    private final CdcLifecycleListener lifecycleListener;
+    private final List<CdcEventFilter> filters;
+    private final PollingConfig pollingConfig;
+    private volatile boolean running = false;
+}
+```
+
+### 6.2 Initialisation
+
+Called once at startup before the poll loop begins:
+
+```java
+private void initCheckpoint() {
+    long existing = checkpointStrategy.loadLastScn();
+    if (existing == 0) {
+        long currentScn = resolveCurrentScn();
+        checkpointStrategy.saveScn(currentScn);
+    }
+}
+```
+
+If no checkpoint exists, start from the current SCN — do not replay historical events.
+
+### 6.3 Pure Java Lifecycle
+
+```java
+public void start() {
+    lifecycleListener.onStart();
+    running = true;
+    initCheckpoint();
+    while (running) {
+        try {
+            tick();
+            Thread.sleep(pollingConfig.getInterval().toMillis());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            stop();
+        } catch (CdcFatalException e) {
+            stop();
+        }
+    }
+}
+
+public void stop() {
+    running = false;
+    lifecycleListener.onStop();
+}
+```
+
+### 6.4 `tick()` — Single Poll Cycle
+
+Called by `@Scheduled` in Spring, called by the loop in pure Java.
+
+```
+1. toScn  = getCurrentScn()          ← fixed for this entire tick
+2. loop:
+     fromScn = checkpointStrategy.loadLastScn()
+     if fromScn >= toScn → break (caught up)
+     
+     request = PollRequest(fromScn, toScn, batchSize)
+     raw     = pollSafely(request)
+     if raw == null → break (poll error handled, skip tick)
+     
+     filtered = applyFilters(raw)
+     
+     if filtered not empty:
+         handleSafely(filtered)
+         checkpointSafely(maxScn(filtered))    ← max SCN in batch, NOT toScn
+     
+     lifecycleListener.onPollComplete(filtered, request)
+     
+     if raw.size() == batchSize:
+         lifecycleListener.onCatchupLoop(iteration++, fromScn, toScn)
+         continue                              ← may be more, loop same tick
+     else:
+         break                                 ← batch not full, done for this tick
+```
+
+**Key invariants:**
+- `toScn` is captured once per tick and never changes during catchup — no moving target
+- Checkpoint advances to `maxScn(batch)`, never to `toScn` — safe for partial batches
+- Empty filtered list → skip handler and checkpoint, advance nothing
+- Full batch → loop same tick (catchup), do not wait for next interval
+- `getCurrentScn()` is called once per tick only, not per catchup iteration
+
+### 6.5 Error Isolation
+
+```java
+private List<CdcEvent> pollSafely(PollRequest request) {
+    try {
+        return client.poll(request);
+    } catch (Exception e) {
+        errorHandler.onPollError(e, request);
+        return null;  // caller breaks the loop
+    }
+}
+
+private void handleSafely(List<CdcEvent> events) {
+    try {
+        eventHandler.handle(events);
+    } catch (Exception e) {
+        errorHandler.onEventHandlingError(e, events);
+        throw new CdcFatalException("Event handling failed", e);
+    }
+}
+
+private void checkpointSafely(long scn) {
+    try {
+        checkpointStrategy.saveScn(scn);
+    } catch (Exception e) {
+        errorHandler.onCheckpointError(e, scn);
+        throw new CdcFatalException("Checkpoint failed", e);
+    }
+}
+```
+
+### 6.6 Filter Chain
+
+```java
+private List<CdcEvent> applyFilters(List<CdcEvent> events) {
+    if (filters.isEmpty()) return events;
+    return events.stream()
+        .filter(event -> filters.stream().allMatch(f -> f.accept(event)))
+        .collect(Collectors.toList());
+}
+```
+
+### 6.7 SCN Utilities
+
+```java
+private long resolveCurrentScn() {
+    Connection connection = null;
+    try {
+        connection = client.getConnectionProvider().getConnection();
+        return currentScnProvider.getCurrentScn(connection);
+    } catch (SQLException e) {
+        throw new CdcPollingException("Failed to get current SCN", e);
+    } finally {
+        client.getConnectionProvider().releaseConnection(connection);
+    }
+}
+
+private long maxScn(List<CdcEvent> events) {
+    return events.stream()
+        .mapToLong(CdcEvent::getScn)
+        .max()
+        .orElseThrow();
+}
+```
+
+---
+
+## 7. `DefaultCdcClient`
+
+```java
+public class DefaultCdcClient implements CdcClient {
+
+    private final CdcConnectionProvider connectionProvider;
+    private final CdcQueryProvider queryProvider;
+    private final CdcResultMapper resultMapper;
+
+    @Override
+    public List<CdcEvent> poll(PollRequest request) {
+        Connection connection = null;
+        try {
+            connection = connectionProvider.getConnection();
+            String query = queryProvider.getQuery();
+            return executeQuery(connection, query, request);
+        } catch (SQLException e) {
+            throw new CdcPollingException("Poll failed", e);
+        } finally {
+            connectionProvider.releaseConnection(connection);
+        }
+    }
+
+    private List<CdcEvent> executeQuery(Connection connection,
+                                         String query,
+                                         PollRequest request) throws SQLException {
+        NamedParameterQuery namedQuery = NamedParameterQuery.parse(query);
+        try (PreparedStatement stmt = connection.prepareStatement(namedQuery.getSql())) {
+            namedQuery.bind("fromScn", request.getFromScn(), stmt);
+            namedQuery.bind("toScn", request.getToScn(), stmt);
+            namedQuery.bind("maxResults", request.getMaxResults(), stmt);
+            try (ResultSet rs = stmt.executeQuery()) {
+                return resultMapper.map(rs);
+            }
+        }
+    }
+}
+```
+
+`NamedParameterQuery.parse(sql)` replaces `:paramName` occurrences with `?` and tracks their positional index for binding.
+
+---
+
+## 8. `DefaultCdcResultMapper`
+
+Maps each `ResultSet` row into a `CdcEvent`. Reads standard LogMiner metadata columns directly. Delegates business data columns (`SQL_REDO`, `SQL_UNDO`) to `CdcRowMapper`:
+
+```java
+public class DefaultCdcResultMapper implements CdcResultMapper {
+
+    private final CdcRowMapper rowMapper;
+
+    @Override
+    public List<CdcEvent> map(ResultSet rs) throws SQLException {
+        List<CdcEvent> events = new ArrayList<>();
+        while (rs.next()) {
+            OperationType operation = OperationType.valueOf(rs.getString("OPERATION"));
+            Map<String, Object> data = rowMapper.mapRow(
+                rs.getString("SQL_REDO"),
+                rs.getString("SQL_UNDO"),
+                operation
+            );
+            events.add(CdcEvent.builder()
+                .scn(rs.getLong("SCN"))
+                .schema(rs.getString("SEG_OWNER"))
+                .tableName(rs.getString("SEG_NAME"))
+                .operation(operation)
+                .timestamp(rs.getTimestamp("TIMESTAMP").toInstant())
+                .data(data)
+                .build());
+        }
+        return events;
+    }
+}
+```
+
+---
+
+## 9. Connection Providers
+
+### Pure Java — `HikariCdcConnectionProvider`
+```java
+public class HikariCdcConnectionProvider implements CdcConnectionProvider {
+
+    private final HikariDataSource dataSource;
+
+    public HikariCdcConnectionProvider(ConnectionConfig config) {
+        HikariConfig hikariConfig = new HikariConfig();
+        hikariConfig.setJdbcUrl(config.getUrl());
+        hikariConfig.setUsername(config.getUsername());
+        hikariConfig.setPassword(config.getPassword());
+        hikariConfig.setMaximumPoolSize(config.getMaxPoolSize());
+        hikariConfig.setPoolName("cdc-pool");
+        this.dataSource = new HikariDataSource(hikariConfig);
+    }
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        return dataSource.getConnection();
+    }
+
+    @Override
+    public void releaseConnection(Connection connection) {
+        try {
+            if (connection != null && !connection.isClosed()) {
+                connection.close();
+            }
+        } catch (SQLException ignored) {}
+    }
+
+    public void shutdown() {
+        dataSource.close();
+    }
+}
+```
+
+### Spring — `DataSourceCdcConnectionProvider`
+```java
+public class DataSourceCdcConnectionProvider implements CdcConnectionProvider {
+
+    private final DataSource dataSource;
+
+    @Override
+    public Connection getConnection() throws SQLException {
+        return dataSource.getConnection();
+    }
+
+    @Override
+    public void releaseConnection(Connection connection) {
+        DataSourceUtils.releaseConnection(connection, dataSource);
+    }
+}
+```
+
+Uses `DataSourceUtils.releaseConnection()` so connections participate correctly in Spring-managed transactions.
+
+---
+
+## 10. Transaction Responsibility
+
+**`CdcEngine` has no `@Transactional` annotation and no transaction management.** Transaction boundaries are the host service's responsibility.
+
+In a Spring Boot host, the typical approach is to annotate the `@Scheduled` method or wrap `tick()` inside a `@Transactional` service method so that `CdcEventHandler.handle()` (inbox write) and `CheckpointStrategy.saveScn()` (checkpoint write) execute atomically in the same transaction.
+
+The starter does not enforce this — it is a host-level architectural decision.
+
+---
+
+## 11. Spring Boot Starter
+
+### 11.1 `@EnableCdc`
+
+```java
+@Target(ElementType.TYPE)
+@Retention(RetentionPolicy.RUNTIME)
+@Documented
+@Import(CdcAutoConfiguration.class)
+@EnableScheduling
+public @interface EnableCdc {}
+```
+
+Minimal — no attributes. All behavioral choices are made by the host via bean overrides.
+
+### 11.2 `CdcProperties`
+
+```java
+@ConfigurationProperties(prefix = "platform.cdc")
+public class CdcProperties {
+
+    private ConnectionProperties connection = new ConnectionProperties();
+    private List<TableFilterProperties> tables = new ArrayList<>();
+    private PollingProperties polling = new PollingProperties();
+    private CheckpointProperties checkpoint = new CheckpointProperties();
+    private PersistenceProperties persistence = new PersistenceProperties();
+
+    public static class ConnectionProperties {
+        private String url;
+        private String username;
+        private String password;
+        private int maxPoolSize = 10;
+    }
+
+    public static class PollingProperties {
+        private Duration interval = Duration.ofSeconds(5);
+        private int batchSize = 500;
+    }
+
+    public static class CheckpointProperties {
+        private String tableName = "cdc_checkpoint";
+    }
+
+    public static class PersistenceProperties {
+        private String tableName = "cdc_inbox";
+    }
+}
+```
+
+### 11.3 `CdcAutoConfiguration`
+
+```java
+@AutoConfiguration
+@EnableConfigurationProperties(CdcProperties.class)
+@ConditionalOnBean(annotation = EnableCdc.class)
+public class CdcAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcConnectionProvider cdcConnectionProvider(DataSource dataSource) {
+        return new DataSourceCdcConnectionProvider(dataSource);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CurrentScnProvider currentScnProvider() {
+        return new DefaultCurrentScnProvider();
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcResultMapper cdcResultMapper(CdcRowMapper rowMapper) {
+        return new DefaultCdcResultMapper(rowMapper);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CheckpointStrategy checkpointStrategy(DataSource dataSource,
+                                                   CdcProperties properties) {
+        return new JdbcCheckpointStrategy(dataSource,
+            properties.getCheckpoint().getTableName());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcEventHandler cdcEventHandler(DataSource dataSource,
+                                            CdcProperties properties) {
+        return new JdbcCdcEventHandler(dataSource,
+            properties.getPersistence().getTableName());
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcErrorHandler cdcErrorHandler() {
+        return new DefaultCdcErrorHandler();
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcLifecycleListener cdcLifecycleListener() {
+        return new CdcLifecycleListener() {};  // no-op
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcClient cdcClient(CdcConnectionProvider connectionProvider,
+                                CdcQueryProvider queryProvider,
+                                CdcResultMapper resultMapper) {
+        return new DefaultCdcClient(connectionProvider, queryProvider, resultMapper);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcEngine cdcEngine(CdcClient client,
+                                CurrentScnProvider currentScnProvider,
+                                CheckpointStrategy checkpointStrategy,
+                                CdcEventHandler eventHandler,
+                                CdcErrorHandler errorHandler,
+                                CdcLifecycleListener lifecycleListener,
+                                List<CdcEventFilter> filters,
+                                CdcProperties properties) {
+        return new CdcEngine(client, currentScnProvider, checkpointStrategy,
+            eventHandler, errorHandler, lifecycleListener,
+            filters, toPollingConfig(properties));
+    }
+
+    // Missing mandatory beans — fail fast
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcQueryProvider missingQueryProvider() {
+        throw new CdcConfigurationException(
+            "No CdcQueryProvider bean found. Provide a CdcQueryProvider bean to use the CDC starter.");
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    public CdcRowMapper missingRowMapper() {
+        throw new CdcConfigurationException(
+            "No CdcRowMapper bean found. Provide a CdcRowMapper bean to use the CDC starter.");
+    }
+}
+```
+
+### 11.4 `CdcSchedulingConfiguration`
+
+```java
+@Configuration
+@ConditionalOnBean(CdcEngine.class)
+public class CdcSchedulingConfiguration {
+
+    private final CdcEngine engine;
+
+    @Scheduled(fixedDelayString = "${platform.cdc.polling.interval:5000}")
+    public void poll() {
+        engine.tick();
+    }
+}
+```
+
+Uses `fixedDelay` (not `fixedRate`) — next tick starts only after the previous tick (including all catchup iterations) has fully completed.
+
+### 11.5 `AutoConfiguration.imports`
+
+```
+com.platform.cdc.starter.autoconfigure.CdcAutoConfiguration
+com.platform.cdc.starter.autoconfigure.CdcSchedulingConfiguration
+```
+
+---
+
+## 12. Pure Java Usage Example
+
+```java
+public static void main(String[] args) {
+    // Load config from JSON (existing library mechanism)
+    CdcConfiguration config = new JsonFileCdcConfigurationLoader("config.json").load();
+
+    // Wire manually
+    CdcConnectionProvider connectionProvider =
+        new HikariCdcConnectionProvider(config.getConnection());
+
+    CdcQueryProvider queryProvider = () -> """
+        SELECT scn, seg_owner, seg_name, operation, timestamp, sql_redo, sql_undo
+        FROM v$logmnr_contents
+        WHERE scn > :fromScn AND scn <= :toScn
+        AND seg_owner = 'TRADE_SCHEMA'
+        AND seg_name = 'TRADES'
+        AND ROWNUM <= :maxResults
+    """;
+
+    CdcRowMapper rowMapper = (sqlRedo, sqlUndo, operation) -> {
+        // parse SQL_REDO/UNDO and return business field map
+        return Map.of();
+    };
+
+    CdcClient client = new DefaultCdcClient(connectionProvider, queryProvider,
+        new DefaultCdcResultMapper(rowMapper));
+
+    CdcEngine engine = new CdcEngine(
+        client,
+        new DefaultCurrentScnProvider(),
+        new InMemoryCheckpointStrategy(),
+        new LoggingCdcEventHandler(),
+        new DefaultCdcErrorHandler(),
+        new CdcLifecycleListener() {},
+        List.of(),
+        config.getPolling()
+    );
+
+    Runtime.getRuntime().addShutdownHook(new Thread(engine::stop));
+    engine.start();  // blocks
+}
+```
+
+---
+
+## 13. Spring Boot Usage Example
+
+```java
+@SpringBootApplication
+@EnableCdc
+public class TradeServiceApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(TradeServiceApplication.class, args);
+    }
+}
+
+@Configuration
+public class CdcConfig {
+
+    // Mandatory — must be provided
+    @Bean
+    public CdcQueryProvider cdcQueryProvider() {
+        return () -> """
+            SELECT scn, seg_owner, seg_name, operation, timestamp, sql_redo, sql_undo
+            FROM v$logmnr_contents
+            WHERE scn > :fromScn AND scn <= :toScn
+            AND seg_owner = 'TRADE_SCHEMA'
+            AND seg_name = 'TRADES'
+            AND ROWNUM <= :maxResults
+        """;
+    }
+
+    // Mandatory — must be provided
+    @Bean
+    public CdcRowMapper cdcRowMapper() {
+        return (sqlRedo, sqlUndo, operation) -> {
+            // parse SQL_REDO/UNDO into business field map
+            return Map.of();
+        };
+    }
+
+    // Optional — override only if needed
+    @Bean
+    public CdcEventFilter operationFilter() {
+        return new OperationTypeFilter(Set.of(OperationType.INSERT, OperationType.UPDATE));
+    }
+}
+```
+
+```yaml
+platform:
+  cdc:
+    polling:
+      interval: 5000
+      batch-size: 500
+    checkpoint:
+      table-name: cdc_checkpoint
+    persistence:
+      table-name: cdc_inbox
+```
+
+---
+
+## 14. Interface Summary
+
+| Interface | Mandatory | Pure Java Default | Spring Default |
+|---|---|---|---|
+| `CdcQueryProvider` | **yes** | none — fail fast | none — fail fast |
+| `CdcRowMapper` | **yes** | none — fail fast | none — fail fast |
+| `CdcConnectionProvider` | no | `HikariCdcConnectionProvider` | `DataSourceCdcConnectionProvider` |
+| `CurrentScnProvider` | no | `DefaultCurrentScnProvider` | `DefaultCurrentScnProvider` |
+| `CdcResultMapper` | no | `DefaultCdcResultMapper` | `DefaultCdcResultMapper` |
+| `CheckpointStrategy` | no | `InMemoryCheckpointStrategy` | `JdbcCheckpointStrategy` |
+| `CdcEventHandler` | no | `LoggingCdcEventHandler` | `JdbcCdcEventHandler` |
+| `CdcEventFilter` | no | passthrough (empty list) | passthrough (empty list) |
+| `CdcErrorHandler` | no | `DefaultCdcErrorHandler` | `DefaultCdcErrorHandler` |
+| `CdcLifecycleListener` | no | no-op | no-op |
+
+---
+
+## 15. SCN Pagination — Behaviour Reference
+
+```
+Service restart after gap (lastCheckpoint=500, currentScn=10000, batchSize=500):
+
+tick 1:
+  toScn = 10000 (fixed)
+  iteration 1: fromScn=500,  batch=500 events, maxScn=700  → checkpoint=700,  loop
+  iteration 2: fromScn=700,  batch=500 events, maxScn=950  → checkpoint=950,  loop
+  iteration 3: fromScn=950,  batch=200 events, maxScn=1100 → checkpoint=1100, done
+
+tick 2:
+  toScn = 10050 (new snapshot)
+  iteration 1: fromScn=1100, ...
+```
+
+- `toScn` never moves within a tick
+- Checkpoint advances to `maxScn(batch)`, never to `toScn`
+- Partial batch = done for this tick
+- Full batch = may be more, loop
+
+---
+
+## 16. Error Behaviour Reference
+
+| Failure point | Default behaviour | Checkpoint advances? | Engine stops? |
+|---|---|---|---|
+| `poll()` throws | log, skip tick | No | No |
+| `eventHandler.handle()` throws | log, throw fatal | No | Yes |
+| `checkpointStrategy.saveScn()` throws | log, throw fatal | No | Yes |
+| `getCurrentScn()` throws | propagates as `CdcPollingException` | No | Depends on caller |
+
+---
+
+*End of specification.*
