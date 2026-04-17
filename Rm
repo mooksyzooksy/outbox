@@ -1,0 +1,83 @@
+# skill-generator
+
+Generates a ready-to-install OpenCode skill from a folder of markdown documentation files.
+
+---
+
+## Install
+
+```bash
+# Global — available in all your projects
+cp -r skill-generator/ ~/.config/opencode/skills/
+
+# Project-only
+cp -r skill-generator/ .opencode/skills/
+```
+
+Restart OpenCode after installing.
+
+---
+
+## How to use it
+
+Point it at a folder of docs and ask for a skill:
+
+```
+Create a skill from my docs in ./standards/testing/
+```
+
+```
+Generate a skill from ./docs/kafka-conventions/
+```
+
+If it doesn't trigger automatically, force it with `@`:
+
+```
+@skill-generator create a skill from ./standards/java-naming/
+```
+
+---
+
+## What happens
+
+1. The agent reads all `.md` files in the folder
+2. It tells you how many skills it will create and what they'll cover — **confirm before it writes**
+3. It produces the skill folder(s) with a `SKILL.md` and a `references/` folder if needed
+4. It tells you where to copy the output to install it
+
+---
+
+## Output example
+
+Given a `./standards/testing/` folder with unit, integration and e2e docs:
+
+```
+java-testing/
+├── SKILL.md          ← distilled rules + trigger description
+└── references/
+    └── e2e.md        ← large doc placed here verbatim, referenced from SKILL.md
+```
+
+---
+
+## If a generated skill doesn't trigger reliably
+
+Open its `SKILL.md` and make the description more explicit:
+
+```yaml
+description: >-
+  CRITICAL: Enforces Java testing standards. MUST activate when writing unit
+  tests, integration tests, or e2e tests. Always activate when the user
+  mentions JUnit, @Test, Testcontainers, or MockMvc.
+```
+
+Restart OpenCode and test again.
+
+---
+
+## Notes
+
+- Source documentation files are **never modified** — they are read-only inputs
+- Large docs (> 200 lines) are copied verbatim into `references/` — not rewritten
+- The `SKILL.md` body is kept under 500 lines; bulk content goes into `references/`
+- Generated skills are compatible with OpenCode, Claude Code, Cursor, Windsurf, and Codex
