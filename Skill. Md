@@ -1,63 +1,86 @@
 ---
 name: skill-generator
-description: Generate a complete, production-ready OpenCode skill from a folder of documentation files. Use this skill whenever the user points to a folder of markdown docs and wants to turn them into an OpenCode skill, or says things like "create a skill from my docs", "generate a skill for my coding standards", "turn this documentation into a skill", or "make a skill from this folder". Always use this skill when the goal is to produce a SKILL.md (and optionally a references/ folder) from existing internal documentation.
+description: >-
+  CRITICAL: Use this skill to generate a complete, production-ready OpenCode skill from
+  any folder of documentation files. MUST activate whenever the user points to a folder
+  of markdown docs and wants an OpenCode skill out of it. Activate when the user says
+  anything like: "create a skill from my docs", "generate a skill for my standards",
+  "turn this folder into a skill", "make a skill from this documentation", "build a
+  skill from my coding standards", or "convert my docs into a skill". Always activate
+  even if the user does not say the word "skill" but clearly wants to package
+  documentation for agent reuse. Covers: skill structure generation, SKILL.md authoring,
+  progressive disclosure, description trigger optimisation, and references/ organisation.
 ---
 
 # Skill Generator
 
-Turns a folder of internal documentation (markdown files) into a complete, production-ready OpenCode skill with correct structure, a sharp description, and distilled instructions.
+Generates a complete, spec-compliant, enterprise-grade OpenCode skill from a folder of internal documentation files.
 
-## When you are invoked
+## When You Are Invoked
 
 The user will provide one of:
-- A path to a folder containing `.md` files
-- Pasted content of one or more documentation files
+- A path to a folder containing one or more `.md` files
+- Pasted content of documentation files
 - A mix of both
 
-Your job is to produce a ready-to-use skill folder. Do not ask for lengthy clarification upfront — read the docs, make smart decisions, and present the result. Ask only if something is genuinely ambiguous (e.g. two docs seem to cover very different concerns and you're unsure if they belong in one skill or two).
+Your job: produce a ready-to-install skill folder. Do not ask for lengthy clarification upfront. Read the docs, make smart decisions, present the result. Ask only if something is genuinely ambiguous and cannot be inferred.
 
 ---
 
-## Step 1 — Read and Inventory the Source Docs
+## Step 1 — Inventory the Source Docs
 
-If given a folder path, list its contents first, then read each `.md` file. For each file note:
-- Topic domain (e.g. unit testing, Kafka conventions, exception handling)
-- Whether it is prescriptive (rules/standards) or descriptive (explanations)
-- Approximate size
+If given a folder path, list its contents then read each `.md` file. For each file, identify:
+- **Domain**: what topic does it cover? (e.g. unit testing, Kafka naming, exception handling)
+- **Nature**: prescriptive (rules/standards) vs descriptive (explanations/background)
+- **Size**: approximate line count
 
-If there are many files, decide whether they form **one cohesive skill** or should become **multiple separate skills**. Rule of thumb:
-- Same task context → one skill
-- Clearly different agent trigger contexts → separate skills
+Then decide: **one skill or multiple skills?**
 
-Announce your decision to the user before proceeding: "I'll generate one skill covering X, Y, Z" or "I'll generate two skills: one for A, one for B."
+| Condition | Decision |
+|---|---|
+| All files share the same agent trigger context | One skill |
+| Files cover clearly distinct concerns a dev would invoke separately | Multiple skills |
+| One file is very large (>300 lines) and self-contained | One skill + reference file |
+
+**Announce your decision before writing.** Example:
+> "I'll generate two skills: `java-testing` covering unit and integration tests, and `kafka-conventions` covering naming and configuration. Proceeding."
 
 ---
 
 ## Step 2 — Distil the Content
 
-For each skill to generate:
+For each skill, extract signal from the source docs:
 
-### Extract the signal
-- Identify all **hard rules** (must/must not, always/never)
-- Identify **naming conventions**, **structural patterns**, **anti-patterns**
-- Identify **examples** worth keeping (short, high-signal ones only)
-- Discard background explanations that don't constrain agent behaviour
+### What to keep
+- Hard rules: MUST / MUST NOT / always / never
+- Naming conventions with concrete examples
+- Structural patterns (class layout, package structure, annotation order)
+- Anti-patterns and what to avoid
+- Short, high-signal code examples (< 20 lines)
 
-### Organise by sections
-Use a consistent structure in the SKILL.md body:
+### What to discard
+- Background explanations that don't constrain agent behaviour
+- Historical context or rationale ("why we chose X")
+- Repetition across files — consolidate
+- Anything the agent can infer from context
+
+### Section structure for SKILL.md body
 
 ```
 ## Rules
-Numbered, imperative, actionable. One rule per line. No fluff.
+Numbered list. Imperative mood. One rule per item. Actionable.
 
 ## Naming Conventions
-Tables or short lists. Concrete examples preferred.
+Tables preferred. Pattern + Example columns.
+
+## Structure & Patterns
+How to organise code, files, packages. Short examples where useful.
 
 ## Anti-Patterns
-What NOT to do. Critical for agent guardrails.
+What NOT to do. One line per anti-pattern.
 
 ## Examples
-Only include if they materially help the agent. Keep short.
+Only if they materially help. Keep under 20 lines per example.
 ```
 
 Omit any section that would be empty.
@@ -66,81 +89,122 @@ Omit any section that would be empty.
 
 ## Step 3 — Write the Frontmatter
 
-### `name`
-- Lowercase alphanumeric with hyphens only
-- Must match the folder name you will create
+### `name` field
+- Lowercase alphanumeric + single hyphens only
+- Must match the folder name exactly
+- 1–64 characters
 - Regex: `^[a-z0-9]+(-[a-z0-9]+)*$`
-- Examples: `java-testing`, `kafka-conventions`, `exception-handling`
+- Examples: `java-testing`, `kafka-conventions`, `exception-handling`, `angular-standards`
 
-### `description`
+### `description` field
 - Maximum 1024 characters
-- **This is the trigger** — the agent reads only name + description to decide if a skill is relevant
-- Must answer: what does this skill cover? when should it activate?
-- Be explicit and slightly "pushy" — agents tend to undertrigger. Include synonyms and task phrases the user would naturally say.
-- Pattern to follow:
-  ```
-  Enforces [team/company] standards for [domain]. Use this skill when writing, reviewing, or generating [specific artifacts]. 
-  Covers: [topic A], [topic B], [topic C]. Always activate when the user mentions [trigger words].
-  ```
+- **This is the primary trigger mechanism** — the agent reads ONLY name + description to decide whether to load this skill
+- Must convey: what the skill enforces + when to activate
+- Use strong signal words: MUST, CRITICAL, always activate when...
+- Include synonyms and natural-language phrases a developer would say
+- Template:
+
+```
+CRITICAL: Enforces [team] standards for [domain]. MUST activate when writing, reviewing,
+or generating [artifacts]. Covers: [A], [B], [C]. Always use when the user mentions
+[trigger words or phrases].
+```
+
+> ⚠️ Agents tend to undertrigger. Be explicit and direct in the description.
+> Words like MUST and CRITICAL consistently improve trigger reliability.
 
 ---
 
-## Step 4 — Decide on references/
+## Step 4 — Decide on `references/`
 
-Use `references/` when:
-- A source doc is large (>200 lines) and covers a specific sub-topic
-- The agent only needs the full detail occasionally (not every time)
+Move content to `references/` when:
+- A source doc is large (> 200 lines) and covers a specific sub-topic
+- The agent only needs full detail occasionally, not on every invocation
+- The SKILL.md body would exceed 500 lines without offloading
 
-Place verbatim (or lightly cleaned) source docs into `references/`. Reference them from SKILL.md like:
+For each reference file:
+- Keep it focused on one sub-topic
+- Add a table of contents at the top if > 300 lines
+- Point to it clearly from SKILL.md body:
 
 ```markdown
-> For full detail on [topic], read `references/[filename].md`.
+> For full naming convention tables, read `references/naming.md`.
+> Load `references/kafka-config.md` when configuring consumers or producers.
 ```
-
-Keep the SKILL.md body itself under 500 lines. If you are going over, move content into references/.
 
 ---
 
 ## Step 5 — Output the Skill
 
-Create the full folder structure on disk:
+Create the full folder structure:
 
 ```
 <skill-name>/
 ├── SKILL.md
 └── references/        ← only if needed
-    └── *.md
+    └── <topic>.md
 ```
 
-Place it either:
-- Where the user asked, or
-- In `.opencode/skills/<skill-name>/` by default if no destination was specified
+Default output location: `.opencode/skills/<skill-name>/`
+Use user-specified path if provided.
 
-Then show the user:
-1. The full content of `SKILL.md`
-2. A list of any reference files created and what they contain
-3. A one-line installation note:
-   > Copy the `<skill-name>/` folder to `.opencode/skills/` in your project root (or `~/.config/opencode/skills/` for global use).
+Present to the user:
+1. Full content of `SKILL.md`
+2. List of reference files created with a one-line description of each
+3. The installation note below
 
 ---
 
-## Quality checklist before presenting output
+## Installation Note — Always Present This
 
-- [ ] `name` matches folder name and passes regex
-- [ ] `description` is under 1024 chars, trigger-oriented, slightly pushy
+```
+Global install (available in all projects):
+  cp -r <skill-name>/ ~/.config/opencode/skills/
+
+Project install (this repo only):
+  cp -r <skill-name>/ .opencode/skills/
+
+Restart OpenCode after installing to pick up the new skill.
+```
+
+---
+
+## Quality Checklist — Run Before Presenting Output
+
+- [ ] `name` matches folder name and passes regex `^[a-z0-9]+(-[a-z0-9]+)*$`
+- [ ] `description` is under 1024 characters
+- [ ] `description` contains MUST / CRITICAL and clear trigger phrases
+- [ ] `description` lists the main domains/topics covered
 - [ ] SKILL.md body is under 500 lines
-- [ ] All rules are imperative and actionable (not descriptive)
-- [ ] No copy-pasted walls of text from source docs
-- [ ] Reference files pointed to clearly from SKILL.md
+- [ ] All rules are imperative and actionable — no explanatory prose in rules sections
 - [ ] No section is present but empty
+- [ ] No wall-of-text copy-pasted verbatim from source docs
+- [ ] Large source docs (> 200 lines) moved to `references/` and referenced from SKILL.md
+- [ ] Reference files have clear load instructions in SKILL.md
+- [ ] Code examples are under 20 lines and genuinely high-signal
+
+Fix any failing item before presenting output.
 
 ---
 
-## What NOT to do
+## Edge Cases
 
-- Do not copy-paste entire source documents into the SKILL.md body
-- Do not write descriptions that are vague ("covers coding standards")
-- Do not include explanatory prose that doesn't constrain agent behaviour
-- Do not create a references/ folder if all content fits cleanly in SKILL.md under 500 lines
-- Do not generate multiple skills when one is sufficient
-- Do not ask for permission before reading files — just read them
+**Conflicting rules across files**: Apply the most restrictive rule. Add a comment noting the conflict at the top of the relevant section.
+
+**Very large source folder (10+ files)**: Group by domain, one skill per group. Present the grouping plan to the user before writing anything.
+
+**Source doc is already a SKILL.md**: Treat as a draft — apply the quality checklist and rewrite the description for better triggering.
+
+**Non-English source docs**: Generate the skill in the same language as the docs unless the user requests otherwise.
+
+---
+
+## Hard Constraints
+
+- **NEVER modify the content of source documentation files** — they are read-only inputs. When placing a doc in `references/`, copy it verbatim. The only writing you do is `SKILL.md` and new reference files derived from the source docs.
+- Never copy-paste entire source documents into SKILL.md body
+- Never write vague descriptions like "covers coding standards"
+- Never include prose that explains rather than constrains agent behaviour
+- Never create `references/` if all content fits cleanly under 500 lines
+- Never ask for permission before reading files — read them
+- Never present output without completing the quality checklist
