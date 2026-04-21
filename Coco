@@ -1,0 +1,50 @@
+<build>
+    <plugins>
+        <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <executions>
+
+                <!-- Collects all per-module merged .exec files into one -->
+                <execution>
+                    <id>root-merge-of-merges</id>
+                    <phase>verify</phase>
+                    <goals><goal>merge</goal></goals>
+                    <configuration>
+                        <destFile>
+                            ${maven.multiModuleProjectDirectory}/target/jacoco/merged/jacoco-all.exec
+                        </destFile>
+                        <fileSets>
+                            <fileSet>
+                                <directory>${maven.multiModuleProjectDirectory}</directory>
+                                <includes>
+                                    <!-- adjust filename to match what your parent produces -->
+                                    <include>**/target/jacoco/merged/jacoco-merged.exec</include>
+                                </includes>
+                                <excludes>
+                                    <exclude>target/jacoco/merged/jacoco-all.exec</exclude>
+                                </excludes>
+                            </fileSet>
+                        </fileSets>
+                    </configuration>
+                </execution>
+
+                <!-- Generates the single XML that Sonar reads -->
+                <execution>
+                    <id>root-report</id>
+                    <phase>verify</phase>
+                    <goals><goal>report</goal></goals>
+                    <configuration>
+                        <dataFile>
+                            ${maven.multiModuleProjectDirectory}/target/jacoco/merged/jacoco-all.exec
+                        </dataFile>
+                        <outputDirectory>
+                            ${maven.multiModuleProjectDirectory}/target/jacoco/merged
+                        </outputDirectory>
+                    </configuration>
+                </execution>
+
+            </executions>
+        </plugin>
+    </plugins>
+</build>
